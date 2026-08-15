@@ -1,0 +1,25 @@
+{
+  "name": "skinstudio",
+  "version": "1.0.0",
+  "description": "Server-side HTTP API rendering full-body Minecraft skin poses, Lunar Client cosmetics, and Lunar Client emotes.",
+  "type": "module",
+  "main": "src/server.js",
+  "scripts": {
+    "dev": "node --watch src/server.js",
+    "start": "node src/server.js",
+    "test": "node --test",
+    "audit:dragon-wings": "node scripts/audit-dragon-wings.js",
+    "audit:cosmetics": "node scripts/audit-cosmetics.js",
+    "audit:emotes": "node scripts/audit-emotes.js",
+    "audit:summary": "node scripts/summarize-cosmetic-audit.js",
+    "render:oberaudorf": "node scripts/render-oberaudorf.js",
+    "render:modes": "node scripts/render-modes.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "pngjs": "^7.0.0",
+    "sharp": "^0.35.3"
+  }
+}
