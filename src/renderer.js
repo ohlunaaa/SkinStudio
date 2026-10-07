@@ -957,6 +957,25 @@ function shadePixel(triangle, weights, px, py) {
   }, triangle.shaderTime);
 }
 
+/**
+ * The camera's yaw at one point of a turning animation.
+ *
+ * A full turn walks straight round and meets its own first frame at the seam,
+ * so a turntable loops. Anything short of that goes out and comes back - a
+ * straight A-to-B clip would snap back to A every time the GIF repeats.
+ *
+ * @param start the yaw the turn starts from
+ * @param end the yaw it turns to, or null for no turn
+ * @param cycle 0..1 through the clip, or null for a still
+ * @returns degrees
+ */
+function sweptYaw(start, end, cycle) {
+  if (end == null || cycle == null) return start;
+  const turn = Math.max(-360, Math.min(360, end - start));
+  const t = Math.abs(turn) >= 360 ? cycle : 1 - Math.abs(2 * cycle - 1);
+  return start + turn * t;
+}
+
 function parseBackground(background) {
   if (!background || background === "transparent") return [0, 0, 0, 0];
   const normalized = background.replace(/^#/, "");
@@ -1348,7 +1367,9 @@ export function renderSkin(skinBuffer, options = {}) {
     ? sampleEmotePose(options.emote, options.frame)
     : getPose(options.pose ?? "showcase", options.frame);
   if (!pose) throw new Error(`Unknown pose '${options.pose}'.`);
-  const cameraYaw = isometric ? TRUE_ISOMETRIC_YAW : (options.yaw ?? pose.cameraYaw ?? -10);
+  const cameraYaw = isometric
+    ? TRUE_ISOMETRIC_YAW
+    : sweptYaw(options.yaw ?? pose.cameraYaw ?? -10, options.yawEnd, options.yawCycle);
   const cameraPitch = isometric ? TRUE_ISOMETRIC_PITCH : (options.pitch ?? pose.cameraPitch ?? 12);
   if (pose.pointAtCamera) {
     pose[pose.pointAtCamera] = {

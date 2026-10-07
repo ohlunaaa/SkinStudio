@@ -215,6 +215,9 @@ function renderOptions(searchParams, detectedSlim = false, routeFormat) {
     height,
     frame: numberParameter(searchParams, "frame", undefined, 0, 1),
     yaw: numberParameter(searchParams, "yaw", undefined, -180, 180),
+    // Where an animation's camera turns TO; the renderer clamps the turn to
+    // one full circle from wherever it starts.
+    yawEnd: numberParameter(searchParams, "yawEnd", undefined, -540, 540),
     pitch: numberParameter(searchParams, "pitch", undefined, -45, 45),
     padding: numberParameter(searchParams, "padding", 0.1, 0, 0.3),
     antialias,
@@ -397,6 +400,7 @@ async function renderOutput(skin, options) {
       ...options,
       frame: (startFrame + index / options.frames) % 1,
       stableFraming: true,
+      yawCycle: index / options.frames,
     };
     if (animateAuraTimeline) {
       const cycle = index / options.frames;
