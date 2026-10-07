@@ -1172,16 +1172,39 @@ function parseBedrockGeometry(geometryJson, texture, descriptor, animationJson) 
       ));
     }
   }
+  const shift = descriptor.type === "companion" ? companionShift(geometryJson, grouped) : 0;
   return [...grouped.entries()].map(([attachment, triangles]) => {
-    if (descriptor.type !== "companion") return { attachment, triangles };
+    if (!shift) return { attachment, triangles };
     return {
       attachment,
       triangles: triangles.map((triangle) => ({
         ...triangle,
-        points: triangle.points.map(([x, y, z]) => [x - 11, y, z]),
+        points: triangle.points.map(([x, y, z]) => [x + shift, y, z]),
       })),
     };
   });
+}
+
+// A flat 11-unit shift left wide companions (Triceratops, Kiln, Shark) standing
+// inside the player's arm, which ends at x = -8. Cached per model because the
+// bones move per GIF frame, and a per-frame shift would make the companion slide.
+const COMPANION_CLEAR_X = -11;
+const COMPANION_MIN_SHIFT = 11;
+const COMPANION_MAX_SHIFT = 24;
+const companionShifts = new WeakMap();
+
+function companionShift(geometryJson, grouped) {
+  if (companionShifts.has(geometryJson)) return companionShifts.get(geometryJson);
+  let maxX = -Infinity;
+  for (const triangles of grouped.values()) {
+    for (const triangle of triangles) {
+      for (const [x] of triangle.points) if (x > maxX) maxX = x;
+    }
+  }
+  const needed = Number.isFinite(maxX) ? maxX - COMPANION_CLEAR_X : COMPANION_MIN_SHIFT;
+  const shift = -Math.min(COMPANION_MAX_SHIFT, Math.max(COMPANION_MIN_SHIFT, needed));
+  companionShifts.set(geometryJson, shift);
+  return shift;
 }
 
 function missingAsset(item, paths) {

@@ -829,6 +829,8 @@ function projectGeometry(
   stableFraming,
   target,
   fovDegrees,
+  framing = null,
+  measureOnly = false,
 ) {
   const yaw = (yawDegrees * Math.PI) / 180;
   const pitch = (pitchDegrees * Math.PI) / 180;
@@ -860,12 +862,24 @@ function projectGeometry(
       all.push(cameraPoint(point));
     }
   }
+  if (measureOnly) {
+    return {
+      minX: Math.min(...all.map((point) => point.x)),
+      maxX: Math.max(...all.map((point) => point.x)),
+      minY: Math.min(...all.map((point) => point.y)),
+      maxY: Math.max(...all.map((point) => point.y)),
+    };
+  }
   const usableWidth = width * (1 - padding * 2);
   const usableHeight = height * (1 - padding * 2);
   let scale;
   let centerX;
   let centerY;
-  if (perspective && fovDegrees != null) {
+  if (framing) {
+    scale = Math.min(usableWidth / (framing.maxX - framing.minX), usableHeight / (framing.maxY - framing.minY));
+    centerX = (framing.minX + framing.maxX) / 2;
+    centerY = (framing.minY + framing.maxY) / 2;
+  } else if (perspective && fovDegrees != null) {
     scale = height / (2 * Math.tan((fovDegrees * Math.PI) / 360));
     centerX = 0;
     centerY = 0;
@@ -1413,7 +1427,10 @@ export function renderSkin(skinBuffer, options = {}) {
     options.stableFraming ?? false,
     options.cameraTarget ?? (options.mode === "head" ? [0, 28, 0] : [0, 16, 0]),
     options.fov,
+    options.framing ?? null,
+    options.measureFraming ?? false,
   );
+  if (options.measureFraming) return projection;
 
   // Draw opaque base geometry before transparent outer skin layers. The depth
   // buffer still resolves overlaps between independently rotated body parts.

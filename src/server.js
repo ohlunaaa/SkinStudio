@@ -395,30 +395,48 @@ async function renderOutput(skin, options) {
   const playbackSeconds = options.frames / fps;
   const oscillationSpanSeconds = playbackSeconds / 2;
   const frames = [];
-  for (let index = 0; index < options.frames; index += 1) {
-    const frameOptions = {
-      ...options,
-      frame: (startFrame + index / options.frames) % 1,
-      stableFraming: true,
-      yawCycle: index / options.frames,
-    };
-    if (animateAuraTimeline) {
-      const cycle = index / options.frames;
-      const bounce = 1 - Math.abs(2 * cycle - 1);
-      frameOptions.cosmetics = await prepareCosmetics(options.cosmeticIds, {
-        slim: options.slim,
-        lifeTime: DEFAULT_ANIMATION_TIME + bounce * oscillationSpanSeconds,
-        fallTime: DEFAULT_ANIMATION_TIME + index / fps,
-        // Not the ping-ponged `cycle`: a texture strip is authored to loop, so
-        // it is walked straight through once and meets its own first frame at
-        // the seam. Bouncing it would play the animation backwards halfway.
-        texturePhase: index / options.frames,
-      });
-      // The same ping-pong as lifeTime: a shader has no loop of its own that a
-      // clip could close on, so it plays forward and back.
-      frameOptions.shaderTime = DEFAULT_ANIMATION_TIME + bounce * oscillationSpanSeconds;
+  // The fixed 40-unit stable framing cuts off a companion standing beside the
+  // player, so those GIFs are framed on the union of every frame's bounds.
+  const companion = (options.cosmetics || []).some((cosmetic) => cosmetic.category === "companion");
+  let framing = null;
+  for (const measuring of companion ? [true, false] : [false]) {
+    for (let index = 0; index < options.frames; index += 1) {
+      const frameOptions = {
+        ...options,
+        frame: (startFrame + index / options.frames) % 1,
+        stableFraming: true,
+        yawCycle: index / options.frames,
+        framing,
+        measureFraming: measuring,
+      };
+      if (animateAuraTimeline) {
+        const cycle = index / options.frames;
+        const bounce = 1 - Math.abs(2 * cycle - 1);
+        frameOptions.cosmetics = await prepareCosmetics(options.cosmeticIds, {
+          slim: options.slim,
+          lifeTime: DEFAULT_ANIMATION_TIME + bounce * oscillationSpanSeconds,
+          fallTime: DEFAULT_ANIMATION_TIME + index / fps,
+          // Not the ping-ponged `cycle`: a texture strip is authored to loop, so
+          // it is walked straight through once and meets its own first frame at
+          // the seam. Bouncing it would play the animation backwards halfway.
+          texturePhase: index / options.frames,
+        });
+        // The same ping-pong as lifeTime: a shader has no loop of its own that a
+        // clip could close on, so it plays forward and back.
+        frameOptions.shaderTime = DEFAULT_ANIMATION_TIME + bounce * oscillationSpanSeconds;
+      }
+      const out = renderSkin(skin, frameOptions);
+      if (!measuring) frames.push(out);
+      else if (!framing) framing = out;
+      else {
+        framing = {
+          minX: Math.min(framing.minX, out.minX),
+          maxX: Math.max(framing.maxX, out.maxX),
+          minY: Math.min(framing.minY, out.minY),
+          maxY: Math.max(framing.maxY, out.maxY),
+        };
+      }
     }
-    frames.push(renderSkin(skin, frameOptions));
   }
   if (options.format === "gif") {
     return {
