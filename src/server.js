@@ -218,6 +218,8 @@ function renderOptions(searchParams, detectedSlim = false, routeFormat) {
     // Where an animation's camera turns TO; the renderer clamps the turn to
     // one full circle from wherever it starts.
     yawEnd: numberParameter(searchParams, "yawEnd", undefined, -540, 540),
+    // How many times the pose or emote plays across one animation.
+    loops: numberParameter(searchParams, "loops", 1, 1, 120),
     pitch: numberParameter(searchParams, "pitch", undefined, -45, 45),
     padding: numberParameter(searchParams, "padding", 0.1, 0, 0.3),
     antialias,
@@ -354,6 +356,10 @@ async function renderOutput(skin, options) {
   if (!Number.isInteger(options.frames) || !Number.isInteger(options.fps)) {
     throw new RequestError("frames and fps must be whole numbers.");
   }
+  // A fractional count would end the clip mid-animation and break its loop.
+  if (!Number.isInteger(options.loops)) {
+    throw new RequestError("loops must be a whole number.");
+  }
   const startFrame = options.frame ?? 0;
   // Cosmetics are otherwise baked once and reused for every frame, so a
   // life_time-driven aura (falling leaves, a swirling wind ring, ...) would
@@ -403,7 +409,9 @@ async function renderOutput(skin, options) {
     for (let index = 0; index < options.frames; index += 1) {
       const frameOptions = {
         ...options,
-        frame: (startFrame + index / options.frames) % 1,
+        // yawCycle still spans the whole clip, so a camera turn can outlast a
+        // short emote that plays `loops` times inside it.
+        frame: (startFrame + (index * options.loops) / options.frames) % 1,
         stableFraming: true,
         yawCycle: index / options.frames,
         framing,
