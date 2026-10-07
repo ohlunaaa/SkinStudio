@@ -4,6 +4,7 @@ import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import sharp from "sharp";
+import { bindShader, shaderCloakFor } from "./shader-cloaks.js";
 
 const EPSILON = 1e-5;
 // A representative moment (in seconds) to sample continuous, life_time-driven
@@ -1240,12 +1241,24 @@ async function prepareGecko(item, { slim = false, lifeTime, fallTime, texturePha
   };
 }
 
+// The placeholder texture stays the cloak's texture: it still sizes the UVs
+// and casts the shadow. The shader only replaces the colour it draws.
+async function prepareShader(item) {
+  const port = shaderCloakFor(item.resource);
+  if (!port) return null;
+  const textures = {};
+  for (const [name, { resource }] of Object.entries(port.samplers ?? {})) {
+    textures[name] = await decodeTexture(await ensureResource(resource));
+  }
+  return bindShader(port, textures);
+}
+
 async function prepareLegacy(item, options = {}) {
   const texturePath = await ensureResource(item.resource);
   await ensureResource(`${item.resource}.mcmeta`, { optional: true });
   const texture = await decodeTexture(texturePath, options.texturePhase ?? null);
   if (item.category === "cloak") {
-    return { ...publicItem(item), texture, meshes: makeCloak(texture) };
+    return { ...publicItem(item), texture, meshes: makeCloak(texture), shader: await prepareShader(item) };
   }
   if (item.category === "dragon_wings") {
     return { ...publicItem(item), texture, meshes: makeLegacyWings(texture) };

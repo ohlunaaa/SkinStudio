@@ -410,6 +410,9 @@ async function renderOutput(skin, options) {
         // the seam. Bouncing it would play the animation backwards halfway.
         texturePhase: index / options.frames,
       });
+      // The same ping-pong as lifeTime: a shader has no loop of its own that a
+      // clip could close on, so it plays forward and back.
+      frameOptions.shaderTime = DEFAULT_ANIMATION_TIME + bounce * oscillationSpanSeconds;
     }
     frames.push(renderSkin(skin, frameOptions));
   }
