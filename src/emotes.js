@@ -529,7 +529,13 @@ function sampleBoneMatrices(prepared, time) {
 
 /** Samples Lunar's native Blender/Blockbuster action into the Minecraft rig. */
 export function sampleEmotePose(prepared, normalizedFrame = 0) {
-  const duration = Number(prepared.duration) || prepared.action.maximumFrame || 1;
+  // Never sample past the last keyframe. The manifest's `duration` and the
+  // action's own length agree for every emote measured except get_griddy, whose
+  // manifest says 364 while the animation ends at 121.33 - so two thirds of a
+  // rendered clip was the frozen end pose.
+  const declared = Number(prepared.duration) || 0;
+  const actual = Number(prepared.action?.maximumFrame) || 0;
+  const duration = (actual > 0 && (declared === 0 || actual < declared)) ? actual : (declared || 1);
   const phase = ((Number(normalizedFrame) || 0) % 1 + 1) % 1;
   const time = phase * duration;
   const anchor = sampleBone(prepared.action, "anchor", time);

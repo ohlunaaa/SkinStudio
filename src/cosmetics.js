@@ -4,6 +4,7 @@ import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import sharp from "sharp";
+import { bindShader, shaderCloakFor } from "./shader-cloaks.js";
 
 const EPSILON = 1e-5;
 // A representative moment (in seconds) to sample continuous, life_time-driven
@@ -41,6 +42,7 @@ const FACE_INDICES = {
 
 let catalogCache;
 const textureCache = new Map();
+const sheetCache = new Map();
 const jsonCache = new Map();
 const textCache = new Map();
 const downloadCache = new Map();
@@ -258,12 +260,13 @@ function findLegacyModel(item) {
   };
 }
 
-async function decodeTexture(path) {
-  let value = textureCache.get(path);
+// How one texture file is laid out. Read from the header and the .mcmeta only -
+// no pixels - so resolving which frame a render wants costs nothing.
+async function sheetLayout(path) {
+  let value = sheetCache.get(path);
   if (!value) {
     value = (async () => {
-      let image = sharp(path, { animated: false });
-      const metadata = await image.metadata();
+      const metadata = await sharp(path, { animated: false }).metadata();
       let frameWidth = metadata.width;
       let frameHeight = metadata.height;
       let animationMetadata;
@@ -284,30 +287,85 @@ async function decodeTexture(path) {
           // A broken optional animation descriptor should not hide a valid texture.
         }
       }
-      if (frameWidth < metadata.width || frameHeight < metadata.height) {
-        const columns = Math.max(1, Math.floor(metadata.width / frameWidth));
-        const rows = Math.max(1, Math.floor(metadata.height / frameHeight));
-        const frameCount = columns * rows;
-        const configuredFrames = animationMetadata?.frames;
-        const middle = Math.floor((configuredFrames?.length || frameCount) / 2);
-        const configured = configuredFrames?.[middle];
-        const frame = Math.max(0, Math.min(
-          frameCount - 1,
-          Number(typeof configured === "object" ? configured.index : configured) || middle,
-        ));
+      const tiled = frameWidth < metadata.width || frameHeight < metadata.height;
+      const columns = Math.max(1, Math.floor(metadata.width / frameWidth));
+      const rows = Math.max(1, Math.floor(metadata.height / frameHeight));
+      return {
+        frameWidth, frameHeight, columns, rows,
+        frameCount: tiled ? columns * rows : 1,
+        frames: animationMetadata?.frames,
+        // Minecraft's own default when the mcmeta omits it: one tick a frame.
+        frametime: Math.max(1, Number(animationMetadata?.frametime) || 1),
+        tiled,
+      };
+    })();
+    sheetCache.set(path, value);
+  }
+  return value;
+}
+
+// An animated Lunar texture is a STRIP OF FRAMES, and only one of them was ever
+// drawn: this picked the middle of the strip, so a cloak's own animation never
+// played. Measured on Dancing Cats (9713), a 352x4352 sheet of sixteen 352x272
+// frames, rendered as frame 8 sixteen times over.
+//
+// `phase` is the render's 0..1 position through the clip, so a GIF walks the
+// whole strip exactly once and therefore loops seamlessly. A null phase keeps
+// the middle frame, which is the representative one a still PNG should show.
+function sheetFrameIndex(layout, phase) {
+  const slots = layout.frames?.length || layout.frameCount;
+  const slot = phase == null
+    ? Math.floor(slots / 2)
+    : Math.min(slots - 1, Math.max(0, Math.floor(((((Number(phase) || 0) % 1) + 1) % 1) * slots)));
+  const configured = layout.frames?.[slot];
+  // Not `|| slot`: an mcmeta entry of 0 means frame 0, which `||` would discard.
+  const chosen = Number(typeof configured === "object" ? configured?.index : configured);
+  return Math.max(0, Math.min(layout.frameCount - 1, Number.isFinite(chosen) ? chosen : slot));
+}
+
+async function decodeTexture(path, phase = null) {
+  const layout = await sheetLayout(path);
+  // Keyed on the resolved FRAME, never on the phase: a texture that is not a
+  // strip resolves to 0 for every phase, so it is still decoded and held once.
+  const frame = sheetFrameIndex(layout, layout.tiled ? phase : null);
+  const key = `${path}|${frame}`;
+  let value = textureCache.get(key);
+  if (!value) {
+    value = (async () => {
+      let image = sharp(path, { animated: false });
+      if (layout.tiled) {
         image = image.extract({
-          left: (frame % columns) * frameWidth,
-          top: Math.floor(frame / columns) * frameHeight,
-          width: frameWidth,
-          height: frameHeight,
+          left: (frame % layout.columns) * layout.frameWidth,
+          top: Math.floor(frame / layout.columns) * layout.frameHeight,
+          width: layout.frameWidth,
+          height: layout.frameHeight,
         });
       }
       const { data, info } = await image.ensureAlpha().raw().toBuffer({ resolveWithObject: true });
       return { width: info.width, height: info.height, data };
     })();
-    textureCache.set(path, value);
+    textureCache.set(key, value);
+    trackTexture(value);
   }
   return value;
+}
+
+// This held ONE frame per texture and so could be unbounded; holding a whole
+// strip each, it cannot - a Dancing Cats frame is 383 KB decoded and its strip
+// is 6 MB, and the renderer shares 1 GB with the bot that drives it. Insertion
+// order is LRU enough: a render touches every frame of a sheet in one burst.
+const TEXTURE_CACHE_BYTES = 64 * 1024 * 1024;
+let textureCacheBytes = 0;
+async function trackTexture(pending) {
+  const added = await pending.catch(() => null);
+  if (!added) return;
+  textureCacheBytes += added.data.length;
+  while (textureCacheBytes > TEXTURE_CACHE_BYTES && textureCache.size > 1) {
+    const oldest = textureCache.keys().next().value;
+    const gone = await textureCache.get(oldest)?.catch(() => null);
+    textureCache.delete(oldest);
+    textureCacheBytes -= gone?.data?.length ?? 0;
+  }
 }
 
 function appendQuad(target, points, uvs, attachment, metadata = {}) {
@@ -410,40 +468,54 @@ function makeLegacyWings(texture) {
   // visible wing panels live in 224px squares; the adjacent copies are their
   // reverse sides. Mapping the entire atlas onto two quads exposes unrelated
   // model parts as the characteristic black bars seen on older cosmetics.
+  //
+  // The two squares are the vanilla dragon's WING and WING TIP. Each carries a
+  // bone along its bottom edge and along one side, so a wing is the two placed
+  // SIDE BY SIDE and flipped upright: the bottom bones join into one straight
+  // top edge, and the side bones meet in the middle as the vertical rib. They
+  // were stacked vertically with both side bones against the spine, which drew
+  // every legacy wing as a tall strip hanging down the player's back.
   const scaleX = texture.width / 1024;
   const scaleY = texture.height / 1024;
-  const upperUvs = uvCorners(0, 352, 224, 224, scaleX, scaleY);
-  const lowerUvs = uvCorners(0, 576, 224, 224, scaleX, scaleY);
+  // uvCorners returns [TL, BL, BR, TR]; handing a quad [BL, TL, TR, BR] flips it
+  // vertically, which turns each square's bottom bone into the wing's top edge.
+  const flip = ([tl, bl, br, tr]) => [bl, tl, tr, br];
+  // Row 576: bone on the RIGHT, so it is the inner half - its bone is the rib.
+  const innerUvs = flip(uvCorners(0, 576, 224, 224, scaleX, scaleY));
+  // Row 352: bone on the LEFT, so it is the outer half - its bone is the rib.
+  const outerUvs = flip(uvCorners(0, 352, 224, 224, scaleX, scaleY));
   const inner = 0.75;
   const outer = 13.5;
-  const upperBottom = 16;
-  const upperTop = 29;
-  const lowerBottom = 4;
-  const lowerTop = 17;
+  const rib = (inner + outer) / 2;
+  // Square halves, as the atlas squares are: the whole wing is 2:1, which is the
+  // proportion of Lunar's own render of these cosmetics.
+  const top = 23;
+  const bottom = top - (rib - inner);
   const innerZ = -2.7;
   const outerZ = -4.2;
+  const ribZ = innerZ + (outerZ - innerZ) * ((rib - inner) / (outer - inner));
   const triangles = [];
   for (const side of [-1, 1]) {
     appendQuad(
       triangles,
       [
-        [side * inner, upperTop, innerZ],
-        [side * inner, upperBottom, innerZ],
-        [side * outer, upperBottom, outerZ],
-        [side * outer, upperTop, outerZ],
+        [side * inner, top, innerZ],
+        [side * inner, bottom, innerZ],
+        [side * rib, bottom, ribZ],
+        [side * rib, top, ribZ],
       ],
-      upperUvs,
+      innerUvs,
       "body",
     );
     appendQuad(
       triangles,
       [
-        [side * outer, lowerBottom, outerZ],
-        [side * outer, lowerTop, outerZ],
-        [side * inner, lowerTop, innerZ],
-        [side * inner, lowerBottom, innerZ],
+        [side * rib, top, ribZ],
+        [side * rib, bottom, ribZ],
+        [side * outer, bottom, outerZ],
+        [side * outer, top, outerZ],
       ],
-      lowerUvs,
+      outerUvs,
       "body",
     );
   }
@@ -1100,16 +1172,39 @@ function parseBedrockGeometry(geometryJson, texture, descriptor, animationJson) 
       ));
     }
   }
+  const shift = descriptor.type === "companion" ? companionShift(geometryJson, grouped) : 0;
   return [...grouped.entries()].map(([attachment, triangles]) => {
-    if (descriptor.type !== "companion") return { attachment, triangles };
+    if (!shift) return { attachment, triangles };
     return {
       attachment,
       triangles: triangles.map((triangle) => ({
         ...triangle,
-        points: triangle.points.map(([x, y, z]) => [x - 11, y, z]),
+        points: triangle.points.map(([x, y, z]) => [x + shift, y, z]),
       })),
     };
   });
+}
+
+// A flat 11-unit shift left wide companions (Triceratops, Kiln, Shark) standing
+// inside the player's arm, which ends at x = -8. Cached per model because the
+// bones move per GIF frame, and a per-frame shift would make the companion slide.
+const COMPANION_CLEAR_X = -11;
+const COMPANION_MIN_SHIFT = 11;
+const COMPANION_MAX_SHIFT = 24;
+const companionShifts = new WeakMap();
+
+function companionShift(geometryJson, grouped) {
+  if (companionShifts.has(geometryJson)) return companionShifts.get(geometryJson);
+  let maxX = -Infinity;
+  for (const triangles of grouped.values()) {
+    for (const triangle of triangles) {
+      for (const [x] of triangle.points) if (x > maxX) maxX = x;
+    }
+  }
+  const needed = Number.isFinite(maxX) ? maxX - COMPANION_CLEAR_X : COMPANION_MIN_SHIFT;
+  const shift = -Math.min(COMPANION_MAX_SHIFT, Math.max(COMPANION_MIN_SHIFT, needed));
+  companionShifts.set(geometryJson, shift);
+  return shift;
 }
 
 function missingAsset(item, paths) {
@@ -1132,7 +1227,7 @@ function conditionalResource(value, slim) {
   return matched?.[0] || entries[0]?.[0] || null;
 }
 
-async function prepareGecko(item, { slim = false, lifeTime, fallTime } = {}) {
+async function prepareGecko(item, { slim = false, lifeTime, fallTime, texturePhase = null } = {}) {
   const descriptorPath = await ensureResource(item.resource);
   const descriptor = await cachedJson(descriptorPath);
   const modelResource = conditionalResource(descriptor.model, slim);
@@ -1145,7 +1240,7 @@ async function prepareGecko(item, { slim = false, lifeTime, fallTime } = {}) {
   ]);
   const [geometry, texture, animation] = await Promise.all([
     cachedJson(modelPath),
-    decodeTexture(texturePath),
+    decodeTexture(texturePath, texturePhase),
     animationPath ? cachedJson(animationPath) : null,
   ]);
   const hiddenParts = [
@@ -1169,12 +1264,24 @@ async function prepareGecko(item, { slim = false, lifeTime, fallTime } = {}) {
   };
 }
 
-async function prepareLegacy(item) {
+// The placeholder texture stays the cloak's texture: it still sizes the UVs
+// and casts the shadow. The shader only replaces the colour it draws.
+async function prepareShader(item) {
+  const port = shaderCloakFor(item.resource);
+  if (!port) return null;
+  const textures = {};
+  for (const [name, { resource }] of Object.entries(port.samplers ?? {})) {
+    textures[name] = await decodeTexture(await ensureResource(resource));
+  }
+  return bindShader(port, textures);
+}
+
+async function prepareLegacy(item, options = {}) {
   const texturePath = await ensureResource(item.resource);
   await ensureResource(`${item.resource}.mcmeta`, { optional: true });
-  const texture = await decodeTexture(texturePath);
+  const texture = await decodeTexture(texturePath, options.texturePhase ?? null);
   if (item.category === "cloak") {
-    return { ...publicItem(item), texture, meshes: makeCloak(texture) };
+    return { ...publicItem(item), texture, meshes: makeCloak(texture), shader: await prepareShader(item) };
   }
   if (item.category === "dragon_wings") {
     return { ...publicItem(item), texture, meshes: makeLegacyWings(texture) };
@@ -1200,12 +1307,50 @@ async function prepareLegacy(item) {
   };
 }
 
+/**
+ * How long one pass of these cosmetics' texture animation really lasts.
+ *
+ * `frametime` is in Minecraft ticks, 20 to the second, and it is the only thing
+ * that says how fast a strip is meant to play - measured across the catalogue
+ * it ranges 2 to 6, i.e. 10fps down to 3.3fps. Ignoring it and fitting the
+ * strip to whatever clip was asked for plays Dancing Cats 3.2x too fast and
+ * Khalih Voidflame 4.8x.
+ *
+ * The caller turns this into the clip's fps, so one pass of the longest strip
+ * IS the clip: true speed, and the loop still closes on itself.
+ *
+ * @param ids the cosmetic ids being rendered
+ * @returns seconds, or 0 when none of them is a texture strip
+ */
+export async function cosmeticClipSeconds(ids) {
+  if (!ids?.length) return 0;
+  const state = await loadCatalogState();
+  let longest = 0;
+  for (const id of ids) {
+    const item = state.byId.get(Number(id));
+    // Geckolib cosmetics are paced by their own Molang clock, not by a strip.
+    if (!item?.animated || item.geckolibCosmetic || !item.resource) continue;
+    try {
+      const path = await ensureResource(item.resource);
+      await ensureResource(`${item.resource}.mcmeta`, { optional: true });
+      const layout = await sheetLayout(path);
+      if (!layout.tiled) continue;
+      const count = layout.frames?.length || layout.frameCount;
+      longest = Math.max(longest, (count * layout.frametime) / 20);
+    } catch {
+      // A cosmetic whose texture will not resolve is one the render is about to
+      // fail on anyway; pacing is not the place to report it.
+    }
+  }
+  return longest;
+}
+
 export async function prepareCosmetics(ids, options = {}) {
   if (!ids?.length) return [];
   const state = await loadCatalogState();
   return Promise.all(ids.map(async (id) => {
     const item = state.byId.get(Number(id));
     if (!item) throw new LunarCosmeticError(`Unknown Lunar cosmetic id '${id}'.`, 404);
-    return item.geckolibCosmetic ? prepareGecko(item, options) : prepareLegacy(item);
+    return item.geckolibCosmetic ? prepareGecko(item, options) : prepareLegacy(item, options);
   }));
 }

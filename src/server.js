@@ -9,6 +9,7 @@ import {
   listCosmetics,
   LunarCosmeticError,
   prepareCosmetics,
+  cosmeticClipSeconds,
 } from "./cosmetics.js";
 import {
   getEmote,
@@ -214,6 +215,11 @@ function renderOptions(searchParams, detectedSlim = false, routeFormat) {
     height,
     frame: numberParameter(searchParams, "frame", undefined, 0, 1),
     yaw: numberParameter(searchParams, "yaw", undefined, -180, 180),
+    // Where an animation's camera turns TO; the renderer clamps the turn to
+    // one full circle from wherever it starts.
+    yawEnd: numberParameter(searchParams, "yawEnd", undefined, -540, 540),
+    // How many times the pose or emote plays across one animation.
+    loops: numberParameter(searchParams, "loops", 1, 1, 120),
     pitch: numberParameter(searchParams, "pitch", undefined, -45, 45),
     padding: numberParameter(searchParams, "padding", 0.1, 0, 0.3),
     antialias,
@@ -350,6 +356,10 @@ async function renderOutput(skin, options) {
   if (!Number.isInteger(options.frames) || !Number.isInteger(options.fps)) {
     throw new RequestError("frames and fps must be whole numbers.");
   }
+  // A fractional count would end the clip mid-animation and break its loop.
+  if (!Number.isInteger(options.loops)) {
+    throw new RequestError("loops must be a whole number.");
+  }
   const startFrame = options.frame ?? 0;
   // Cosmetics are otherwise baked once and reused for every frame, so a
   // life_time-driven aura (falling leaves, a swirling wind ring, ...) would
@@ -371,33 +381,78 @@ async function renderOutput(skin, options) {
   // speed close to how fast it actually runs rather than a fixed swing that
   // reads faster on a short clip and slower on a long one.
   const animateAuraTimeline = options.animateCosmetics && options.cosmeticIds?.length > 0;
-  const playbackSeconds = options.frames / options.fps;
+  // A texture strip has a speed of its own - frametime ticks per frame - and
+  // the clip has to last one whole pass of it or the animation plays at
+  // whatever rate the requested frame count happens to imply. Measured before
+  // this: Dancing Cats ran 3.2x too fast, Khalih Voidflame 4.8x.
+  //
+  // FPS is what gives, never the frame count: stretching the clip this way is
+  // free, where rendering more frames would cost the render host a multiple of
+  // its memory budget for the same motion.
+  // NOT when an emote is playing: there the emote is the subject and its own
+  // tick duration already set frames and fps, so pacing to a cape's strip
+  // instead would play the dance at the cape's speed.
+  const stripSeconds = animateAuraTimeline && !options.emote
+    ? await cosmeticClipSeconds(options.cosmeticIds)
+    : 0;
+  const fps = stripSeconds > 0
+    ? Math.min(30, Math.max(1, options.frames / stripSeconds))
+    : options.fps;
+  const playbackSeconds = options.frames / fps;
   const oscillationSpanSeconds = playbackSeconds / 2;
   const frames = [];
-  for (let index = 0; index < options.frames; index += 1) {
-    const frameOptions = {
-      ...options,
-      frame: (startFrame + index / options.frames) % 1,
-      stableFraming: true,
-    };
-    if (animateAuraTimeline) {
-      const cycle = index / options.frames;
-      const bounce = 1 - Math.abs(2 * cycle - 1);
-      frameOptions.cosmetics = await prepareCosmetics(options.cosmeticIds, {
-        slim: options.slim,
-        lifeTime: DEFAULT_ANIMATION_TIME + bounce * oscillationSpanSeconds,
-        fallTime: DEFAULT_ANIMATION_TIME + index / options.fps,
-      });
+  // The fixed 40-unit stable framing cuts off a companion standing beside the
+  // player, so those GIFs are framed on the union of every frame's bounds.
+  const companion = (options.cosmetics || []).some((cosmetic) => cosmetic.category === "companion");
+  let framing = null;
+  for (const measuring of companion ? [true, false] : [false]) {
+    for (let index = 0; index < options.frames; index += 1) {
+      const frameOptions = {
+        ...options,
+        // yawCycle still spans the whole clip, so a camera turn can outlast a
+        // short emote that plays `loops` times inside it.
+        frame: (startFrame + (index * options.loops) / options.frames) % 1,
+        stableFraming: true,
+        yawCycle: index / options.frames,
+        framing,
+        measureFraming: measuring,
+      };
+      if (animateAuraTimeline) {
+        const cycle = index / options.frames;
+        const bounce = 1 - Math.abs(2 * cycle - 1);
+        frameOptions.cosmetics = await prepareCosmetics(options.cosmeticIds, {
+          slim: options.slim,
+          lifeTime: DEFAULT_ANIMATION_TIME + bounce * oscillationSpanSeconds,
+          fallTime: DEFAULT_ANIMATION_TIME + index / fps,
+          // Not the ping-ponged `cycle`: a texture strip is authored to loop, so
+          // it is walked straight through once and meets its own first frame at
+          // the seam. Bouncing it would play the animation backwards halfway.
+          texturePhase: index / options.frames,
+        });
+        // The same ping-pong as lifeTime: a shader has no loop of its own that a
+        // clip could close on, so it plays forward and back.
+        frameOptions.shaderTime = DEFAULT_ANIMATION_TIME + bounce * oscillationSpanSeconds;
+      }
+      const out = renderSkin(skin, frameOptions);
+      if (!measuring) frames.push(out);
+      else if (!framing) framing = out;
+      else {
+        framing = {
+          minX: Math.min(framing.minX, out.minX),
+          maxX: Math.max(framing.maxX, out.maxX),
+          minY: Math.min(framing.minY, out.minY),
+          maxY: Math.max(framing.maxY, out.maxY),
+        };
+      }
     }
-    frames.push(renderSkin(skin, frameOptions));
   }
   if (options.format === "gif") {
     return {
-      body: await encodeGif(frames, { fps: options.fps }),
+      body: await encodeGif(frames, { fps }),
       contentType: "image/gif",
     };
   }
-  return { body: encodeApng(frames, { fps: options.fps }), contentType: "image/apng" };
+  return { body: encodeApng(frames, { fps }), contentType: "image/apng" };
 }
 
 async function compatibilityOutput(mode, skin, options) {

@@ -350,6 +350,8 @@ curl -X POST \
 | `fps` | `12` | Frame rate, 1 to 30 FPS |
 | `background` | `transparent` | `transparent`, `RRGGBB`, or `RRGGBBAA` |
 | `yaw` | `-10` | Camera rotation for non-isometric projections |
+| `yawEnd` | none | Animated only: the camera turns from `yaw` to `yawEnd` across the clip, -540 to 540. Exactly 360 from the start is a looping turntable; anything shorter goes out and back. Ignored by stills |
+| `loops` | `1` | Animated only: whole number of times the pose or emote plays inside the clip while a `yawEnd` turn spans all of it, 1 to 120 |
 | `pitch` | `12` | Camera height for non-isometric projections |
 | `padding` | `0.1` | Margin as a fraction of the image, 0 to 0.3 |
 | `antialias` | `2` | Edge smoothing: 1 or 2 |

@@ -3,6 +3,9 @@ import { sampleEmotePose } from "./emotes.js";
 import { getPose } from "./poses.js";
 
 const EPSILON = 1e-7;
+// A still of a shader cloak shows this moment of it - the same instant a still
+// of a timeline cosmetic is sampled at (DEFAULT_ANIMATION_TIME).
+const DEFAULT_SHADER_TIME = 1.2;
 const TRUE_ISOMETRIC_YAW = -45;
 const TRUE_ISOMETRIC_PITCH = 35.264389682754654;
 
@@ -743,6 +746,7 @@ function makeCosmeticGeometry(cosmetics, pose, options = {}) {
             vectorSubtract(points[2], points[0]),
           )),
           texture: cosmetic.texture,
+          shader: cosmetic.shader ?? null,
           cosmeticId: cosmetic.id,
           // Cosmetics are rendered after both skin layers. The small camera-
           // depth bias keeps face/body cosmetics above a voxelized second
@@ -825,6 +829,8 @@ function projectGeometry(
   stableFraming,
   target,
   fovDegrees,
+  framing = null,
+  measureOnly = false,
 ) {
   const yaw = (yawDegrees * Math.PI) / 180;
   const pitch = (pitchDegrees * Math.PI) / 180;
@@ -856,12 +862,24 @@ function projectGeometry(
       all.push(cameraPoint(point));
     }
   }
+  if (measureOnly) {
+    return {
+      minX: Math.min(...all.map((point) => point.x)),
+      maxX: Math.max(...all.map((point) => point.x)),
+      minY: Math.min(...all.map((point) => point.y)),
+      maxY: Math.max(...all.map((point) => point.y)),
+    };
+  }
   const usableWidth = width * (1 - padding * 2);
   const usableHeight = height * (1 - padding * 2);
   let scale;
   let centerX;
   let centerY;
-  if (perspective && fovDegrees != null) {
+  if (framing) {
+    scale = Math.min(usableWidth / (framing.maxX - framing.minX), usableHeight / (framing.maxY - framing.minY));
+    centerX = (framing.minX + framing.maxX) / 2;
+    centerY = (framing.minY + framing.maxY) / 2;
+  } else if (perspective && fovDegrees != null) {
     scale = height / (2 * Math.tan((fovDegrees * Math.PI) / 360));
     centerX = 0;
     centerY = 0;
@@ -898,7 +916,78 @@ function projectGeometry(
       perspective,
     })),
     projectPoint,
+    eye: { camera, right, up, forward },
   };
+}
+
+// A shader cloak's inputs in the space Lunar hands them over in: eye space,
+// GL-style (camera at the origin looking down -Z, Y up), in blocks. Everything
+// but the barycentric weights is constant over a flat triangle, so it is
+// worked out once here rather than per pixel.
+function shaderInputs(triangle, eye, width, height) {
+  const toEye = (point) => {
+    const relative = vectorSubtract(point, eye.camera);
+    return [dot(relative, eye.right) / 16, dot(relative, eye.up) / 16, -dot(relative, eye.forward) / 16];
+  };
+  const [a, b, c] = triangle.points;
+  const denominator = (b[1] - c[1]) * (a[0] - c[0]) + (c[0] - b[0]) * (a[1] - c[1]);
+  if (Math.abs(denominator) < EPSILON) return null;
+  // d(weight)/d(screen x) and /d(screen y). Screen y runs down and GL's dFdy
+  // runs up, hence the sign on the second row.
+  const dx = [(b[1] - c[1]) / denominator, (c[1] - a[1]) / denominator];
+  dx.push(-dx[0] - dx[1]);
+  const dy = [-(c[0] - b[0]) / denominator, -(a[0] - c[0]) / denominator];
+  dy.push(-dy[0] - dy[1]);
+  const eyePoints = triangle.worldPoints.map(toEye);
+  const texture = triangle.texture;
+  const uvs = triangle.uvs.map(([u, v]) => [u / texture.width, v / texture.height]);
+  const along = (values, d) => values[0].map((_, axis) => d[0] * values[0][axis] + d[1] * values[1][axis] + d[2] * values[2][axis]);
+  const normal = triangle.normal;
+  return {
+    eyePoints,
+    uvs,
+    normal: [dot(normal, eye.right), dot(normal, eye.up), -dot(normal, eye.forward)],
+    derivatives: {
+      dPdx: along(eyePoints, dx),
+      dPdy: along(eyePoints, dy),
+      dUx: along(uvs, dx),
+      dUy: along(uvs, dy),
+    },
+    width,
+    height,
+  };
+}
+
+function shadePixel(triangle, weights, px, py) {
+  const inputs = triangle.shaderInputs;
+  const [p0, p1, p2] = weights;
+  const blend = (values) => values[0].map((_, axis) => p0 * values[0][axis] + p1 * values[1][axis] + p2 * values[2][axis]);
+  return triangle.shader({
+    uv: blend(inputs.uvs),
+    worldPos: blend(inputs.eyePoints),
+    normal: inputs.normal,
+    screenUV: [px / inputs.width, 1 - py / inputs.height],
+    derivatives: inputs.derivatives,
+  }, triangle.shaderTime);
+}
+
+/**
+ * The camera's yaw at one point of a turning animation.
+ *
+ * A full turn walks straight round and meets its own first frame at the seam,
+ * so a turntable loops. Anything short of that goes out and comes back - a
+ * straight A-to-B clip would snap back to A every time the GIF repeats.
+ *
+ * @param start the yaw the turn starts from
+ * @param end the yaw it turns to, or null for no turn
+ * @param cycle 0..1 through the clip, or null for a still
+ * @returns degrees
+ */
+function sweptYaw(start, end, cycle) {
+  if (end == null || cycle == null) return start;
+  const turn = Math.max(-360, Math.min(360, end - start));
+  const t = Math.abs(turn) >= 360 ? cycle : 1 - Math.abs(2 * cycle - 1);
+  return start + turn * t;
 }
 
 function parseBackground(background) {
@@ -1064,6 +1153,7 @@ function rasterizeTriangle(triangle, target, depthBuffer, texture, light, shadow
       if (depth >= depthBuffer[pixelIndex]) continue;
 
       const sourceTexture = triangle.texture || texture;
+      const shaded = triangle.shaderInputs ? shadePixel(triangle, weights, px, py) : null;
       const u = Math.max(0, Math.min(sourceTexture.width - 1, Math.floor(
         p0 * triangle.uvs[0][0] + p1 * triangle.uvs[1][0] + p2 * triangle.uvs[2][0],
       )));
@@ -1071,7 +1161,10 @@ function rasterizeTriangle(triangle, target, depthBuffer, texture, light, shadow
         p0 * triangle.uvs[0][1] + p1 * triangle.uvs[1][1] + p2 * triangle.uvs[2][1],
       )));
       const textureIndex = (v * sourceTexture.width + u) * 4;
-      const sourceAlpha = sourceTexture.data[textureIndex + 3] / 255;
+      const sourceColor = shaded
+        ? shaded.map((channel) => clampByte(channel * 255))
+        : sourceTexture.data.subarray(textureIndex, textureIndex + 4);
+      const sourceAlpha = sourceColor[3] / 255;
       if (sourceAlpha <= 0) continue;
 
       const worldPoint = [
@@ -1099,13 +1192,13 @@ function rasterizeTriangle(triangle, target, depthBuffer, texture, light, shadow
       const outputAlpha = sourceAlpha + destinationAlpha * (1 - sourceAlpha);
       const blend = outputAlpha === 0 ? 0 : sourceAlpha / outputAlpha;
       target.data[outputIndex] = clampByte(
-        sourceTexture.data[textureIndex] * shade * blend + target.data[outputIndex] * (1 - blend),
+        sourceColor[0] * shade * blend + target.data[outputIndex] * (1 - blend),
       );
       target.data[outputIndex + 1] = clampByte(
-        sourceTexture.data[textureIndex + 1] * shade * blend + target.data[outputIndex + 1] * (1 - blend),
+        sourceColor[1] * shade * blend + target.data[outputIndex + 1] * (1 - blend),
       );
       target.data[outputIndex + 2] = clampByte(
-        sourceTexture.data[textureIndex + 2] * shade * blend + target.data[outputIndex + 2] * (1 - blend),
+        sourceColor[2] * shade * blend + target.data[outputIndex + 2] * (1 - blend),
       );
       target.data[outputIndex + 3] = Math.round(outputAlpha * 255);
       depthBuffer[pixelIndex] = depth;
@@ -1288,7 +1381,9 @@ export function renderSkin(skinBuffer, options = {}) {
     ? sampleEmotePose(options.emote, options.frame)
     : getPose(options.pose ?? "showcase", options.frame);
   if (!pose) throw new Error(`Unknown pose '${options.pose}'.`);
-  const cameraYaw = isometric ? TRUE_ISOMETRIC_YAW : (options.yaw ?? pose.cameraYaw ?? -10);
+  const cameraYaw = isometric
+    ? TRUE_ISOMETRIC_YAW
+    : sweptYaw(options.yaw ?? pose.cameraYaw ?? -10, options.yawEnd, options.yawCycle);
   const cameraPitch = isometric ? TRUE_ISOMETRIC_PITCH : (options.pitch ?? pose.cameraPitch ?? 12);
   if (pose.pointAtCamera) {
     pose[pose.pointAtCamera] = {
@@ -1332,7 +1427,10 @@ export function renderSkin(skinBuffer, options = {}) {
     options.stableFraming ?? false,
     options.cameraTarget ?? (options.mode === "head" ? [0, 28, 0] : [0, 16, 0]),
     options.fov,
+    options.framing ?? null,
+    options.measureFraming ?? false,
   );
+  if (options.measureFraming) return projection;
 
   // Draw opaque base geometry before transparent outer skin layers. The depth
   // buffer still resolves overlaps between independently rotated body parts.
@@ -1344,6 +1442,12 @@ export function renderSkin(skinBuffer, options = {}) {
   const light = normalize([-0.5, 0.9, 1.2]);
   const shading = options.shading ?? true;
   const shadowMap = options.shadow === false || !shading ? null : buildShadowMap(geometry, texture, light);
+  for (const triangle of projection.triangles) {
+    if (triangle.shader) {
+      triangle.shaderInputs = shaderInputs(triangle, projection.eye, renderWidth, renderHeight);
+      triangle.shaderTime = options.shaderTime ?? DEFAULT_SHADER_TIME;
+    }
+  }
   for (const triangle of projection.triangles) {
     rasterizeTriangle(triangle, output, depthBuffer, texture, light, shadowMap, shading);
   }
