@@ -467,40 +467,54 @@ function makeLegacyWings(texture) {
   // visible wing panels live in 224px squares; the adjacent copies are their
   // reverse sides. Mapping the entire atlas onto two quads exposes unrelated
   // model parts as the characteristic black bars seen on older cosmetics.
+  //
+  // The two squares are the vanilla dragon's WING and WING TIP. Each carries a
+  // bone along its bottom edge and along one side, so a wing is the two placed
+  // SIDE BY SIDE and flipped upright: the bottom bones join into one straight
+  // top edge, and the side bones meet in the middle as the vertical rib. They
+  // were stacked vertically with both side bones against the spine, which drew
+  // every legacy wing as a tall strip hanging down the player's back.
   const scaleX = texture.width / 1024;
   const scaleY = texture.height / 1024;
-  const upperUvs = uvCorners(0, 352, 224, 224, scaleX, scaleY);
-  const lowerUvs = uvCorners(0, 576, 224, 224, scaleX, scaleY);
+  // uvCorners returns [TL, BL, BR, TR]; handing a quad [BL, TL, TR, BR] flips it
+  // vertically, which turns each square's bottom bone into the wing's top edge.
+  const flip = ([tl, bl, br, tr]) => [bl, tl, tr, br];
+  // Row 576: bone on the RIGHT, so it is the inner half - its bone is the rib.
+  const innerUvs = flip(uvCorners(0, 576, 224, 224, scaleX, scaleY));
+  // Row 352: bone on the LEFT, so it is the outer half - its bone is the rib.
+  const outerUvs = flip(uvCorners(0, 352, 224, 224, scaleX, scaleY));
   const inner = 0.75;
   const outer = 13.5;
-  const upperBottom = 16;
-  const upperTop = 29;
-  const lowerBottom = 4;
-  const lowerTop = 17;
+  const rib = (inner + outer) / 2;
+  // Square halves, as the atlas squares are: the whole wing is 2:1, which is the
+  // proportion of Lunar's own render of these cosmetics.
+  const top = 23;
+  const bottom = top - (rib - inner);
   const innerZ = -2.7;
   const outerZ = -4.2;
+  const ribZ = innerZ + (outerZ - innerZ) * ((rib - inner) / (outer - inner));
   const triangles = [];
   for (const side of [-1, 1]) {
     appendQuad(
       triangles,
       [
-        [side * inner, upperTop, innerZ],
-        [side * inner, upperBottom, innerZ],
-        [side * outer, upperBottom, outerZ],
-        [side * outer, upperTop, outerZ],
+        [side * inner, top, innerZ],
+        [side * inner, bottom, innerZ],
+        [side * rib, bottom, ribZ],
+        [side * rib, top, ribZ],
       ],
-      upperUvs,
+      innerUvs,
       "body",
     );
     appendQuad(
       triangles,
       [
-        [side * outer, lowerBottom, outerZ],
-        [side * outer, lowerTop, outerZ],
-        [side * inner, lowerTop, innerZ],
-        [side * inner, lowerBottom, innerZ],
+        [side * rib, top, ribZ],
+        [side * rib, bottom, ribZ],
+        [side * outer, bottom, outerZ],
+        [side * outer, top, outerZ],
       ],
-      lowerUvs,
+      outerUvs,
       "body",
     );
   }
