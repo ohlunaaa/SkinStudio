@@ -9,6 +9,7 @@ import {
   listCosmetics,
   LunarCosmeticError,
   prepareCosmetics,
+  cosmeticClipSeconds,
 } from "./cosmetics.js";
 import {
   getEmote,
@@ -371,7 +372,24 @@ async function renderOutput(skin, options) {
   // speed close to how fast it actually runs rather than a fixed swing that
   // reads faster on a short clip and slower on a long one.
   const animateAuraTimeline = options.animateCosmetics && options.cosmeticIds?.length > 0;
-  const playbackSeconds = options.frames / options.fps;
+  // A texture strip has a speed of its own - frametime ticks per frame - and
+  // the clip has to last one whole pass of it or the animation plays at
+  // whatever rate the requested frame count happens to imply. Measured before
+  // this: Dancing Cats ran 3.2x too fast, Khalih Voidflame 4.8x.
+  //
+  // FPS is what gives, never the frame count: stretching the clip this way is
+  // free, where rendering more frames would cost the render host a multiple of
+  // its memory budget for the same motion.
+  // NOT when an emote is playing: there the emote is the subject and its own
+  // tick duration already set frames and fps, so pacing to a cape's strip
+  // instead would play the dance at the cape's speed.
+  const stripSeconds = animateAuraTimeline && !options.emote
+    ? await cosmeticClipSeconds(options.cosmeticIds)
+    : 0;
+  const fps = stripSeconds > 0
+    ? Math.min(30, Math.max(1, options.frames / stripSeconds))
+    : options.fps;
+  const playbackSeconds = options.frames / fps;
   const oscillationSpanSeconds = playbackSeconds / 2;
   const frames = [];
   for (let index = 0; index < options.frames; index += 1) {
@@ -386,18 +404,22 @@ async function renderOutput(skin, options) {
       frameOptions.cosmetics = await prepareCosmetics(options.cosmeticIds, {
         slim: options.slim,
         lifeTime: DEFAULT_ANIMATION_TIME + bounce * oscillationSpanSeconds,
-        fallTime: DEFAULT_ANIMATION_TIME + index / options.fps,
+        fallTime: DEFAULT_ANIMATION_TIME + index / fps,
+        // Not the ping-ponged `cycle`: a texture strip is authored to loop, so
+        // it is walked straight through once and meets its own first frame at
+        // the seam. Bouncing it would play the animation backwards halfway.
+        texturePhase: index / options.frames,
       });
     }
     frames.push(renderSkin(skin, frameOptions));
   }
   if (options.format === "gif") {
     return {
-      body: await encodeGif(frames, { fps: options.fps }),
+      body: await encodeGif(frames, { fps }),
       contentType: "image/gif",
     };
   }
-  return { body: encodeApng(frames, { fps: options.fps }), contentType: "image/apng" };
+  return { body: encodeApng(frames, { fps }), contentType: "image/apng" };
 }
 
 async function compatibilityOutput(mode, skin, options) {
